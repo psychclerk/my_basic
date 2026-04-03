@@ -45,6 +45,9 @@
 #	include <conio.h>
 #	include <malloc.h>
 #	include <Windows.h>
+#elif defined MB_CP_BORLANDC
+typedef unsigned long uintptr_t;
+typedef long intptr_t;
 #else /* MB_CP_VC */
 #	include <stdint.h>
 #endif /* MB_CP_VC */

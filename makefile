@@ -18,7 +18,7 @@ main_arm.o: shell/main.c core/my_basic.h
 	cc -Os -c shell/main.c -Wno-unused-result -o main_arm.o -target arm64-apple-macos11
 else
 my_basic: my_basic.o main.o
-	cc -o output/my_basic my_basic.o main.o -lm -lrt
+	cc -o output/my_basic my_basic.o main.o -lm -lrt -ldl
 my_basic.o: core/my_basic.c core/my_basic.h
 	cc -Os -c core/my_basic.c -Wno-multichar -Wno-overflow -Wno-unused-result
 main.o: shell/main.c core/my_basic.h

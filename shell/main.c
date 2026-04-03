@@ -42,9 +42,9 @@
 #ifdef MB_CP_BORLANDC
 #	include <Windows.h>
 #endif /* MB_CP_BORLANDC */
-#ifndef MB_CP_VC
+#if !defined MB_CP_VC && !defined MB_CP_BORLANDC
 #	include <stdint.h>
-#endif /* MB_CP_VC */
+#endif /* !MB_CP_VC && !MB_CP_BORLANDC */
 #ifdef MB_CP_CLANG
 #	include <sys/time.h>
 #endif /* MB_CP_CLANG */
@@ -56,6 +56,17 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#ifndef MB_DISABLE_SQLITE
+#	define MB_ENABLE_SQLITE
+#	include "../third_party/sqlite3/sqlite3.h"
+#endif /* MB_DISABLE_SQLITE */
+#if !defined MB_OS_WIN
+#	include <dlfcn.h>
+#endif /* !MB_OS_WIN */
+
+#ifdef MB_CP_BORLANDC
+typedef long intptr_t;
+#endif /* MB_CP_BORLANDC */
 
 #ifdef __cplusplus
 extern "C" {
@@ -104,6 +115,33 @@ extern "C" {
 #define _NOT_FINISHED(s) ((s) == MB_FUNC_OK || (s) == MB_FUNC_SUSPEND || (s) == MB_FUNC_WARNING || (s) == MB_FUNC_ERR || (s) == MB_FUNC_END)
 
 static struct mb_interpreter_t* bas = 0;
+static bool_t _cgi_mode = false;
+static bool_t _cgi_headers_sent = false;
+static int _cgi_status_code = 200;
+static char _cgi_status_text[64];
+static char _cgi_content_type[64];
+static bool_t _cgi_post_body_loaded = false;
+static char* _cgi_post_body = 0;
+#ifdef MB_ENABLE_SQLITE
+static sqlite3* _sqlite_conn = 0;
+static char _sqlite_last_error[256];
+static bool_t _sqlite_api_loaded = false;
+#ifdef MB_OS_WIN
+static HMODULE _sqlite_lib = 0;
+#else /* MB_OS_WIN */
+static void* _sqlite_lib = 0;
+#endif /* MB_OS_WIN */
+static int (*_sqlite3_open_fn)(const char*, sqlite3**) = 0;
+static int (*_sqlite3_close_fn)(sqlite3*) = 0;
+static const char* (*_sqlite3_errmsg_fn)(sqlite3*) = 0;
+static int (*_sqlite3_exec_fn)(sqlite3*, const char*, int (*)(void*, int, char**, char**), void*, char**) = 0;
+static void (*_sqlite3_free_fn)(void*) = 0;
+static int (*_sqlite3_changes_fn)(sqlite3*) = 0;
+static int (*_sqlite3_prepare_v2_fn)(sqlite3*, const char*, int, sqlite3_stmt**, const char**) = 0;
+static int (*_sqlite3_step_fn)(sqlite3_stmt*) = 0;
+static const unsigned char* (*_sqlite3_column_text_fn)(sqlite3_stmt*, int) = 0;
+static int (*_sqlite3_finalize_fn)(sqlite3_stmt*) = 0;
+#endif /* MB_ENABLE_SQLITE */
 
 static jmp_buf mem_failure_point;
 
@@ -1338,6 +1376,642 @@ static int os(struct mb_interpreter_t* s, void** l) {
 	return result;
 }
 
+static int _cgi_hex_to_int(char c) {
+	if(c >= '0' && c <= '9')
+		return c - '0';
+	if(c >= 'a' && c <= 'f')
+		return c - 'a' + 10;
+	if(c >= 'A' && c <= 'F')
+		return c - 'A' + 10;
+
+	return -1;
+}
+
+static char* _cgi_url_decode_dup(const char* src) {
+	char* result = 0;
+	char* out = 0;
+	size_t n = 0;
+
+	if(!src)
+		return 0;
+
+	n = strlen(src);
+	result = (char*)malloc(n + 1);
+	_CHECK_MEM(result);
+	out = result;
+	while(*src) {
+		if(*src == '+' ) {
+			*out++ = ' ';
+			++src;
+		} else if(*src == '%' && src[1] && src[2]) {
+			int hi = _cgi_hex_to_int(src[1]);
+			int lo = _cgi_hex_to_int(src[2]);
+			if(hi >= 0 && lo >= 0) {
+				*out++ = (char)((hi << 4) | lo);
+				src += 3;
+			} else {
+				*out++ = *src++;
+			}
+		} else {
+			*out++ = *src++;
+		}
+	}
+	*out = '\0';
+
+	return result;
+}
+
+static bool_t _cgi_lookup_param(const char* encoded, const char* key, char** out_decoded) {
+	const char* cursor = 0;
+	size_t key_len = 0;
+
+	mb_assert(out_decoded);
+
+	*out_decoded = 0;
+	if(!encoded || !key || !*key)
+		return false;
+
+	key_len = strlen(key);
+	cursor = encoded;
+	while(cursor && *cursor) {
+		const char* pair_end = strchr(cursor, '&');
+		const char* equal = strchr(cursor, '=');
+		size_t klen = 0;
+		const char* value = 0;
+		size_t vlen = 0;
+		char* temp = 0;
+
+		if(!pair_end)
+			pair_end = cursor + strlen(cursor);
+		if(equal && equal < pair_end) {
+			klen = (size_t)(equal - cursor);
+			value = equal + 1;
+			vlen = (size_t)(pair_end - value);
+		} else {
+			klen = (size_t)(pair_end - cursor);
+		}
+
+		if(klen == key_len && !strncmp(cursor, key, key_len)) {
+			temp = (char*)malloc(vlen + 1);
+			_CHECK_MEM(temp);
+			if(value && vlen)
+				memcpy(temp, value, vlen);
+			temp[vlen] = '\0';
+			*out_decoded = _cgi_url_decode_dup(temp);
+			free(temp);
+
+			return *out_decoded != 0;
+		}
+
+		cursor = (*pair_end == '&') ? pair_end + 1 : 0;
+	}
+
+	return false;
+}
+
+static const char* _cgi_get_env(const char* key) {
+	const char* result = 0;
+
+	if(!key)
+		return 0;
+
+	result = getenv(key);
+
+	return result ? result : "";
+}
+
+static bool_t _cgi_is_active(void) {
+	const char* gateway = _cgi_get_env("GATEWAY_INTERFACE");
+	const char* method = _cgi_get_env("REQUEST_METHOD");
+
+	return (bool_t)((gateway && *gateway) || (method && *method));
+}
+
+static void _cgi_load_post_body_if_needed(void) {
+	const char* method = 0;
+	const char* length = 0;
+	long body_len = 0;
+	size_t bytes = 0;
+
+	if(_cgi_post_body_loaded)
+		return;
+
+	_cgi_post_body_loaded = true;
+	method = _cgi_get_env("REQUEST_METHOD");
+	if(!method || mb_stricmp(method, "POST"))
+		return;
+
+	length = _cgi_get_env("CONTENT_LENGTH");
+	if(!length || !*length)
+		return;
+
+	body_len = strtol(length, 0, 10);
+	if(body_len <= 0 || body_len > 1024 * 1024)
+		return;
+
+	_cgi_post_body = (char*)malloc((size_t)body_len + 1);
+	_CHECK_MEM(_cgi_post_body);
+	bytes = fread(_cgi_post_body, 1, (size_t)body_len, stdin);
+	_cgi_post_body[bytes] = '\0';
+}
+
+static void _cgi_send_headers_if_needed(void) {
+	if(!_cgi_mode || _cgi_headers_sent)
+		return;
+
+	if(!_cgi_content_type[0])
+		strcpy(_cgi_content_type, "text/html; charset=utf-8");
+	if(!_cgi_status_text[0])
+		strcpy(_cgi_status_text, "OK");
+
+	printf("Status: %d %s\r\n", _cgi_status_code, _cgi_status_text);
+	printf("Content-Type: %s\r\n", _cgi_content_type);
+	printf("X-Powered-By: MY-BASIC CGI\r\n");
+	printf("\r\n");
+	fflush(stdout);
+	_cgi_headers_sent = true;
+}
+
+static int cgi_mode(struct mb_interpreter_t* s, void** l) {
+	int result = MB_FUNC_OK;
+
+	mb_assert(s && l);
+
+	mb_check(mb_attempt_open_bracket(s, l));
+	mb_check(mb_attempt_close_bracket(s, l));
+	mb_check(mb_push_int(s, l, _cgi_mode ? 1 : 0));
+
+	return result;
+}
+
+static int cgi_env(struct mb_interpreter_t* s, void** l) {
+	int result = MB_FUNC_OK;
+	char* key = 0;
+	const char* value = 0;
+
+	mb_assert(s && l);
+
+	mb_check(mb_attempt_open_bracket(s, l));
+	mb_check(mb_pop_string(s, l, &key));
+	mb_check(mb_attempt_close_bracket(s, l));
+
+	value = _cgi_get_env(key);
+	mb_check(mb_push_string(s, l, mb_memdup(value, (unsigned)(strlen(value) + 1))));
+
+	return result;
+}
+
+static int cgi_set_content_type(struct mb_interpreter_t* s, void** l) {
+	int result = MB_FUNC_OK;
+	char* value = 0;
+
+	mb_assert(s && l);
+
+	mb_check(mb_attempt_open_bracket(s, l));
+	mb_check(mb_pop_string(s, l, &value));
+	mb_check(mb_attempt_close_bracket(s, l));
+
+	if(value && *value) {
+		strncpy(_cgi_content_type, value, sizeof(_cgi_content_type) - 1);
+		_cgi_content_type[sizeof(_cgi_content_type) - 1] = '\0';
+	}
+
+	return result;
+}
+
+static int cgi_status(struct mb_interpreter_t* s, void** l) {
+	int result = MB_FUNC_OK;
+	int_t code = 200;
+	char* text = 0;
+
+	mb_assert(s && l);
+
+	mb_check(mb_attempt_open_bracket(s, l));
+	mb_check(mb_pop_int(s, l, &code));
+	if(mb_has_arg(s, l))
+		mb_check(mb_pop_string(s, l, &text));
+	mb_check(mb_attempt_close_bracket(s, l));
+
+	_cgi_status_code = (int)code;
+	if(text && *text) {
+		strncpy(_cgi_status_text, text, sizeof(_cgi_status_text) - 1);
+		_cgi_status_text[sizeof(_cgi_status_text) - 1] = '\0';
+	}
+
+	return result;
+}
+
+static int cgi_query(struct mb_interpreter_t* s, void** l) {
+	int result = MB_FUNC_OK;
+	char* key = 0;
+	char* decoded = 0;
+	const char* query = 0;
+
+	mb_assert(s && l);
+
+	mb_check(mb_attempt_open_bracket(s, l));
+	mb_check(mb_pop_string(s, l, &key));
+	mb_check(mb_attempt_close_bracket(s, l));
+
+	if(!key) {
+		mb_check(mb_push_string(s, l, mb_memdup("", 1)));
+		return result;
+	}
+
+	_cgi_load_post_body_if_needed();
+	if(_cgi_lookup_param(_cgi_post_body, key, &decoded)) {
+		mb_check(mb_push_string(s, l, mb_memdup(decoded, (unsigned)(strlen(decoded) + 1))));
+		free(decoded);
+		return result;
+	}
+
+	query = _cgi_get_env("QUERY_STRING");
+	if(_cgi_lookup_param(query, key, &decoded)) {
+		mb_check(mb_push_string(s, l, mb_memdup(decoded, (unsigned)(strlen(decoded) + 1))));
+		free(decoded);
+		return result;
+	}
+
+	mb_check(mb_push_string(s, l, mb_memdup("", 1)));
+
+	return result;
+}
+
+static int cgi_print(struct mb_interpreter_t* s, void** l) {
+	int result = MB_FUNC_OK;
+	char* arg = 0;
+
+	mb_assert(s && l);
+
+	mb_check(mb_attempt_open_bracket(s, l));
+	mb_check(mb_pop_string(s, l, &arg));
+	mb_check(mb_attempt_close_bracket(s, l));
+
+	_cgi_send_headers_if_needed();
+	if(arg)
+		fputs(arg, stdout);
+
+	return result;
+}
+
+static int cgi_body(struct mb_interpreter_t* s, void** l) {
+	int result = MB_FUNC_OK;
+
+	mb_assert(s && l);
+
+	mb_check(mb_attempt_open_bracket(s, l));
+	mb_check(mb_attempt_close_bracket(s, l));
+
+	_cgi_load_post_body_if_needed();
+	if(_cgi_post_body) {
+		mb_check(mb_push_string(s, l, mb_memdup(_cgi_post_body, (unsigned)(strlen(_cgi_post_body) + 1))));
+	} else {
+		mb_check(mb_push_string(s, l, mb_memdup("", 1)));
+	}
+
+	return result;
+}
+
+static int cgi_json_escape(struct mb_interpreter_t* s, void** l) {
+	int result = MB_FUNC_OK;
+	char* arg = 0;
+	char* escaped = 0;
+	char* out = 0;
+	size_t n = 0;
+	size_t i = 0;
+
+	mb_assert(s && l);
+
+	mb_check(mb_attempt_open_bracket(s, l));
+	mb_check(mb_pop_string(s, l, &arg));
+	mb_check(mb_attempt_close_bracket(s, l));
+
+	if(!arg) {
+		mb_check(mb_push_string(s, l, mb_memdup("", 1)));
+		return result;
+	}
+
+	n = strlen(arg);
+	escaped = (char*)malloc(n * 6 + 1);
+	_CHECK_MEM(escaped);
+	out = escaped;
+	for(i = 0; i < n; ++i) {
+		unsigned char c = (unsigned char)arg[i];
+		switch(c) {
+		case '\"': *out++ = '\\'; *out++ = '\"'; break;
+		case '\\': *out++ = '\\'; *out++ = '\\'; break;
+		case '\b': *out++ = '\\'; *out++ = 'b'; break;
+		case '\f': *out++ = '\\'; *out++ = 'f'; break;
+		case '\n': *out++ = '\\'; *out++ = 'n'; break;
+		case '\r': *out++ = '\\'; *out++ = 'r'; break;
+		case '\t': *out++ = '\\'; *out++ = 't'; break;
+		default:
+			if(c < 0x20) {
+				sprintf(out, "\\u%04x", c);
+				out += 6;
+			} else {
+				*out++ = (char)c;
+			}
+			break;
+		}
+	}
+	*out = '\0';
+
+	mb_check(mb_push_string(s, l, mb_memdup(escaped, (unsigned)(strlen(escaped) + 1))));
+	free(escaped);
+
+	return result;
+}
+
+static void _cgi_write_json_result(bool_t ok, const char* key, const char* value, int status, const char* status_text) {
+	char* escaped = 0;
+
+	if(value) {
+		size_t n = strlen(value);
+		char* out = 0;
+		size_t i = 0;
+		escaped = (char*)malloc(n * 6 + 1);
+		_CHECK_MEM(escaped);
+		out = escaped;
+		for(i = 0; i < n; ++i) {
+			unsigned char c = (unsigned char)value[i];
+			switch(c) {
+			case '\"': *out++ = '\\'; *out++ = '\"'; break;
+			case '\\': *out++ = '\\'; *out++ = '\\'; break;
+			case '\b': *out++ = '\\'; *out++ = 'b'; break;
+			case '\f': *out++ = '\\'; *out++ = 'f'; break;
+			case '\n': *out++ = '\\'; *out++ = 'n'; break;
+			case '\r': *out++ = '\\'; *out++ = 'r'; break;
+			case '\t': *out++ = '\\'; *out++ = 't'; break;
+			default:
+				if(c < 0x20) {
+					sprintf(out, "\\u%04x", c);
+					out += 6;
+				} else {
+					*out++ = (char)c;
+				}
+				break;
+			}
+		}
+		*out = '\0';
+	} else {
+		escaped = (char*)malloc(1);
+		_CHECK_MEM(escaped);
+		escaped[0] = '\0';
+	}
+
+	strncpy(_cgi_content_type, "application/json; charset=utf-8", sizeof(_cgi_content_type) - 1);
+	_cgi_content_type[sizeof(_cgi_content_type) - 1] = '\0';
+	_cgi_status_code = status;
+	strncpy(_cgi_status_text, status_text, sizeof(_cgi_status_text) - 1);
+	_cgi_status_text[sizeof(_cgi_status_text) - 1] = '\0';
+
+	_cgi_send_headers_if_needed();
+	printf("{\"ok\":%s,\"%s\":\"%s\"}", ok ? "true" : "false", key, escaped);
+	free(escaped);
+}
+
+static int c_json_ok(struct mb_interpreter_t* s, void** l) {
+	int result = MB_FUNC_OK;
+	char* value = 0;
+
+	mb_assert(s && l);
+
+	mb_check(mb_attempt_open_bracket(s, l));
+	mb_check(mb_pop_string(s, l, &value));
+	mb_check(mb_attempt_close_bracket(s, l));
+
+	_cgi_write_json_result(true, "message", value, 200, "OK");
+
+	return result;
+}
+
+static int c_json_err(struct mb_interpreter_t* s, void** l) {
+	int result = MB_FUNC_OK;
+	char* value = 0;
+
+	mb_assert(s && l);
+
+	mb_check(mb_attempt_open_bracket(s, l));
+	mb_check(mb_pop_string(s, l, &value));
+	mb_check(mb_attempt_close_bracket(s, l));
+
+	_cgi_write_json_result(false, "error", value, 500, "Internal Server Error");
+
+	return result;
+}
+
+#ifdef MB_ENABLE_SQLITE
+static void _sqlite_set_error(const char* msg) {
+	if(msg && *msg) {
+		strncpy(_sqlite_last_error, msg, sizeof(_sqlite_last_error) - 1);
+		_sqlite_last_error[sizeof(_sqlite_last_error) - 1] = '\0';
+	} else {
+		_sqlite_last_error[0] = '\0';
+	}
+}
+
+static void* _sqlite_sym(const char* name) {
+#ifdef MB_OS_WIN
+	return (void*)GetProcAddress(_sqlite_lib, name);
+#else /* MB_OS_WIN */
+	return dlsym(_sqlite_lib, name);
+#endif /* MB_OS_WIN */
+}
+
+static bool_t _sqlite_load_api(void) {
+	if(_sqlite_api_loaded)
+		return true;
+
+#ifdef MB_OS_WIN
+	_sqlite_lib = LoadLibraryA("sqlite3.dll");
+#else /* MB_OS_WIN */
+	_sqlite_lib = dlopen("libsqlite3.so", RTLD_NOW);
+	if(!_sqlite_lib)
+		_sqlite_lib = dlopen("libsqlite3.so.0", RTLD_NOW);
+	if(!_sqlite_lib)
+		_sqlite_lib = dlopen("libsqlite3.dylib", RTLD_NOW);
+#endif /* MB_OS_WIN */
+	if(!_sqlite_lib) {
+		_sqlite_set_error("Cannot load sqlite3 dynamic library.");
+		return false;
+	}
+
+	_sqlite3_open_fn = (int (*)(const char*, sqlite3**))_sqlite_sym("sqlite3_open");
+	_sqlite3_close_fn = (int (*)(sqlite3*))_sqlite_sym("sqlite3_close");
+	_sqlite3_errmsg_fn = (const char* (*)(sqlite3*))_sqlite_sym("sqlite3_errmsg");
+	_sqlite3_exec_fn = (int (*)(sqlite3*, const char*, int (*)(void*, int, char**, char**), void*, char**))_sqlite_sym("sqlite3_exec");
+	_sqlite3_free_fn = (void (*)(void*))_sqlite_sym("sqlite3_free");
+	_sqlite3_changes_fn = (int (*)(sqlite3*))_sqlite_sym("sqlite3_changes");
+	_sqlite3_prepare_v2_fn = (int (*)(sqlite3*, const char*, int, sqlite3_stmt**, const char**))_sqlite_sym("sqlite3_prepare_v2");
+	_sqlite3_step_fn = (int (*)(sqlite3_stmt*))_sqlite_sym("sqlite3_step");
+	_sqlite3_column_text_fn = (const unsigned char* (*)(sqlite3_stmt*, int))_sqlite_sym("sqlite3_column_text");
+	_sqlite3_finalize_fn = (int (*)(sqlite3_stmt*))_sqlite_sym("sqlite3_finalize");
+
+	if(!_sqlite3_open_fn || !_sqlite3_close_fn || !_sqlite3_errmsg_fn || !_sqlite3_exec_fn || !_sqlite3_free_fn ||
+		!_sqlite3_changes_fn || !_sqlite3_prepare_v2_fn || !_sqlite3_step_fn || !_sqlite3_column_text_fn || !_sqlite3_finalize_fn) {
+		_sqlite_set_error("Incomplete sqlite3 API symbols.");
+		return false;
+	}
+
+	_sqlite_api_loaded = true;
+
+	return true;
+}
+
+static int c_db_open(struct mb_interpreter_t* s, void** l) {
+	int result = MB_FUNC_OK;
+	char* path = 0;
+	int code = SQLITE_OK;
+
+	mb_assert(s && l);
+
+	mb_check(mb_attempt_open_bracket(s, l));
+	mb_check(mb_pop_string(s, l, &path));
+	mb_check(mb_attempt_close_bracket(s, l));
+
+	if(!_sqlite_load_api()) {
+		mb_check(mb_push_int(s, l, 0));
+		return result;
+	}
+
+	if(_sqlite_conn) {
+		_sqlite3_close_fn(_sqlite_conn);
+		_sqlite_conn = 0;
+	}
+	_sqlite_set_error("");
+	code = _sqlite3_open_fn(path, &_sqlite_conn);
+	if(code != SQLITE_OK) {
+		_sqlite_set_error(_sqlite3_errmsg_fn(_sqlite_conn));
+		mb_check(mb_push_int(s, l, 0));
+	} else {
+		mb_check(mb_push_int(s, l, 1));
+	}
+
+	return result;
+}
+
+static int c_db_close(struct mb_interpreter_t* s, void** l) {
+	int result = MB_FUNC_OK;
+
+	mb_assert(s && l);
+
+	mb_check(mb_attempt_open_bracket(s, l));
+	mb_check(mb_attempt_close_bracket(s, l));
+
+	if(_sqlite_conn) {
+		_sqlite3_close_fn(_sqlite_conn);
+		_sqlite_conn = 0;
+	}
+	_sqlite_set_error("");
+	mb_check(mb_push_int(s, l, 1));
+
+	return result;
+}
+
+static int c_db_exec(struct mb_interpreter_t* s, void** l) {
+	int result = MB_FUNC_OK;
+	char* sql = 0;
+	char* err = 0;
+	int code = SQLITE_OK;
+
+	mb_assert(s && l);
+
+	mb_check(mb_attempt_open_bracket(s, l));
+	mb_check(mb_pop_string(s, l, &sql));
+	mb_check(mb_attempt_close_bracket(s, l));
+
+	if(!_sqlite_load_api()) {
+		mb_check(mb_push_int(s, l, -1));
+		return result;
+	}
+
+	if(!_sqlite_conn) {
+		_sqlite_set_error("Database is not opened.");
+		mb_check(mb_push_int(s, l, -1));
+		return result;
+	}
+
+	_sqlite_set_error("");
+	code = _sqlite3_exec_fn(_sqlite_conn, sql, 0, 0, &err);
+	if(code != SQLITE_OK) {
+		_sqlite_set_error(err ? err : _sqlite3_errmsg_fn(_sqlite_conn));
+		if(err)
+			_sqlite3_free_fn(err);
+		mb_check(mb_push_int(s, l, -1));
+	} else {
+		mb_check(mb_push_int(s, l, _sqlite3_changes_fn(_sqlite_conn)));
+	}
+
+	return result;
+}
+
+static int c_db_query(struct mb_interpreter_t* s, void** l) {
+	int result = MB_FUNC_OK;
+	char* sql = 0;
+	sqlite3_stmt* stmt = 0;
+	int code = SQLITE_OK;
+	const unsigned char* txt = 0;
+
+	mb_assert(s && l);
+
+	mb_check(mb_attempt_open_bracket(s, l));
+	mb_check(mb_pop_string(s, l, &sql));
+	mb_check(mb_attempt_close_bracket(s, l));
+
+	if(!_sqlite_load_api()) {
+		mb_check(mb_push_string(s, l, mb_memdup("", 1)));
+		return result;
+	}
+
+	if(!_sqlite_conn) {
+		_sqlite_set_error("Database is not opened.");
+		mb_check(mb_push_string(s, l, mb_memdup("", 1)));
+		return result;
+	}
+
+	_sqlite_set_error("");
+	code = _sqlite3_prepare_v2_fn(_sqlite_conn, sql, -1, &stmt, 0);
+	if(code != SQLITE_OK) {
+		_sqlite_set_error(_sqlite3_errmsg_fn(_sqlite_conn));
+		mb_check(mb_push_string(s, l, mb_memdup("", 1)));
+		return result;
+	}
+
+	code = _sqlite3_step_fn(stmt);
+	if(code == SQLITE_ROW) {
+		txt = _sqlite3_column_text_fn(stmt, 0);
+		if(txt) {
+			mb_check(mb_push_string(s, l, mb_memdup((const char*)txt, (unsigned)(strlen((const char*)txt) + 1))));
+		} else {
+			mb_check(mb_push_string(s, l, mb_memdup("", 1)));
+		}
+	} else if(code == SQLITE_DONE) {
+		mb_check(mb_push_string(s, l, mb_memdup("", 1)));
+	} else {
+		_sqlite_set_error(_sqlite3_errmsg_fn(_sqlite_conn));
+		mb_check(mb_push_string(s, l, mb_memdup("", 1)));
+	}
+
+	_sqlite3_finalize_fn(stmt);
+
+	return result;
+}
+
+static int c_db_error(struct mb_interpreter_t* s, void** l) {
+	int result = MB_FUNC_OK;
+
+	mb_assert(s && l);
+
+	mb_check(mb_attempt_open_bracket(s, l));
+	mb_check(mb_attempt_close_bracket(s, l));
+
+	mb_check(mb_push_string(s, l, mb_memdup(_sqlite_last_error, (unsigned)(strlen(_sqlite_last_error) + 1))));
+
+	return result;
+}
+#endif /* MB_ENABLE_SQLITE */
+
 static int sys(struct mb_interpreter_t* s, void** l) {
 	int result = MB_FUNC_OK;
 	char* arg = 0;
@@ -1584,6 +2258,13 @@ static void _on_startup(void) {
 	mb_init();
 
 	mb_open(&bas);
+	_cgi_mode = _cgi_is_active();
+	_cgi_headers_sent = false;
+	_cgi_status_code = 200;
+	_cgi_status_text[0] = '\0';
+	_cgi_content_type[0] = '\0';
+	_cgi_post_body_loaded = false;
+	_cgi_post_body = 0;
 
 #if defined MB_CP_VC && defined MB_ENABLE_UNICODE && !MB_UNICODE_NEED_CONVERTING
 	mb_set_inputer(bas, _on_input);
@@ -1597,15 +2278,87 @@ static void _on_startup(void) {
 #endif /* _HAS_TICKS */
 	mb_reg_fun(bas, now);
 	mb_reg_fun(bas, os);
+	mb_reg_fun(bas, cgi_mode);
+	mb_reg_fun(bas, cgi_env);
+	mb_reg_fun(bas, cgi_set_content_type);
+	mb_reg_fun(bas, cgi_status);
+	mb_reg_fun(bas, cgi_query);
+	mb_reg_fun(bas, cgi_print);
+	mb_reg_fun(bas, cgi_body);
+	mb_reg_fun(bas, cgi_json_escape);
+	mb_reg_fun(bas, c_json_ok);
+	mb_reg_fun(bas, c_json_err);
+#ifdef MB_ENABLE_SQLITE
+	_sqlite_last_error[0] = '\0';
+	mb_reg_fun(bas, c_db_open);
+	mb_reg_fun(bas, c_db_close);
+	mb_reg_fun(bas, c_db_exec);
+	mb_reg_fun(bas, c_db_query);
+	mb_reg_fun(bas, c_db_error);
+#endif /* MB_ENABLE_SQLITE */
 	mb_reg_fun(bas, sys);
 	mb_reg_fun(bas, trace);
 	mb_reg_fun(bas, raise);
 	mb_reg_fun(bas, gc);
 	mb_reg_fun(bas, beep);
+
+	{
+		const char* shortcuts[] = {
+			"def GET(k) return cgi_query(k); enddef\n",
+			"def POST(k) return cgi_query(k); enddef\n",
+			"def PARAM(k) return cgi_query(k); enddef\n",
+			"def METHOD() return cgi_env(\"REQUEST_METHOD\"); enddef\n",
+			"def BODY() return cgi_body(); enddef\n",
+			"def ECHO(v) cgi_print(v); enddef\n",
+			"def ECHOLN(v) cgi_print(v + \"\\n\"); enddef\n",
+			"def CONTENT_TYPE(v) cgi_set_content_type(v); enddef\n",
+			"def STATUS(c, t) cgi_status(c, t); enddef\n",
+			"def HTML_PAGE(t, b) CONTENT_TYPE(\"text/html; charset=utf-8\"): ECHO(\"<!doctype html><html><head><meta charset=utf-8><title>\" + t + \"</title></head><body>\" + b + \"</body></html>\"); enddef\n",
+			"def JSON_OK(v) c_json_ok(v); enddef\n",
+			"def JSON_ERR(v) c_json_err(v); enddef\n",
+#ifdef MB_ENABLE_SQLITE
+			"def DB_OPEN(path) return c_db_open(path); enddef\n",
+			"def DB_CLOSE() return c_db_close(); enddef\n",
+			"def DB_EXEC(sql) return c_db_exec(sql); enddef\n",
+			"def DB_QUERY(sql) return c_db_query(sql); enddef\n",
+			"def DB_ERROR() return c_db_error(); enddef\n"
+#endif /* MB_ENABLE_SQLITE */
+		};
+		int i = 0;
+		for(i = 0; i < countof(shortcuts); ++i) {
+			if(mb_load_string(bas, (char*)shortcuts[i], true) != MB_FUNC_OK) {
+				_printf("Failed to load web helper shortcut %d.\n", i + 1);
+				break;
+			}
+		}
+	}
 }
 
 static void _on_exit(void) {
 	_destroy_importing_directories();
+	if(_cgi_post_body) {
+		free(_cgi_post_body);
+		_cgi_post_body = 0;
+		_cgi_post_body_loaded = false;
+	}
+#ifdef MB_ENABLE_SQLITE
+	if(_sqlite_conn) {
+		if(_sqlite3_close_fn)
+			_sqlite3_close_fn(_sqlite_conn);
+		_sqlite_conn = 0;
+	}
+#ifdef MB_OS_WIN
+	if(_sqlite_lib) {
+		FreeLibrary(_sqlite_lib);
+		_sqlite_lib = 0;
+	}
+#else /* MB_OS_WIN */
+	if(_sqlite_lib) {
+		dlclose(_sqlite_lib);
+		_sqlite_lib = 0;
+	}
+#endif /* MB_OS_WIN */
+#endif /* MB_ENABLE_SQLITE */
 
 	if(bas)
 		mb_close(&bas);
