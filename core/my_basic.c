@@ -45,6 +45,9 @@
 #	include <conio.h>
 #	include <malloc.h>
 #	include <Windows.h>
+#elif defined MB_CP_BORLANDC
+typedef unsigned long uintptr_t;
+typedef long intptr_t;
 #else /* MB_CP_VC */
 #	include <stdint.h>
 #endif /* MB_CP_VC */
@@ -941,6 +944,12 @@ static _object_t* _exp_assign = 0;
 
 #define _copy_bytes(__l, __r) do { memcpy((__l), (__r), sizeof(mb_val_bytes_t)); } while(0)
 
+#ifdef MB_CP_BORLANDC
+#	define _mb_uint64 unsigned __int64
+#else /* MB_CP_BORLANDC */
+#	define _mb_uint64 unsigned long long
+#endif /* MB_CP_BORLANDC */
+
 #define _set_real_with_hex(__r, __i) \
 	do { \
 		if(sizeof(__r) == sizeof(unsigned char)) { \
@@ -959,11 +968,11 @@ static _object_t* _exp_assign = 0;
 			union { unsigned long i; real_t r; } __u; \
 			__u.i = __i; \
 			__r = __u.r; \
-		} else if(sizeof(__r) == sizeof(unsigned long long)) { \
-			union { unsigned long long i; real_t r; } __u; \
-			__u.i = __i; \
-			__r = __u.r; \
-		} else { \
+			} else if(sizeof(__r) == sizeof(_mb_uint64)) { \
+				union { _mb_uint64 i; real_t r; } __u; \
+				__u.i = __i; \
+				__r = __u.r; \
+			} else { \
 			mb_assert(0 && "Invalid real number precision."); \
 		} \
 	} while(0)

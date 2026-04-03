@@ -90,6 +90,15 @@ Follow these steps to compile an interpreter binary manually for other platform:
 2. Setup your toolchain for compiling and linking
 3. Compile [`core/my_basic.c`](core/my_basic.c) and [`shell/main.c`](shell/main.c), while both includes [`core/my_basic.h`](core/my_basic.h); then link up an executable
 
+### Building with Borland C++ 5.5 (bcc55)
+
+If you need a Borland C++ 5.5 compatible Windows binary:
+
+1. Install Borland C++ 5.5 and set `BCC55` to the installation directory
+2. Run `build_bcc55.bat`
+3. The executable will be generated at `output\my_basic_bcc55.exe`
+4. Place `sqlite3.dll` beside the executable (or in `PATH`) for `DB_*` functions at runtime
+
 The standalone interpreter supports three running modes:
 
 * Execute the binary without arguments to use the interactive mode
@@ -179,6 +188,29 @@ The manual explains most of the fundamental topics, however it doesn't cover eve
 	* [Stack module](https://github.com/paladin-t/my_basic/wiki/Stack-module)
 * [FAQ](https://github.com/paladin-t/my_basic/wiki/FAQ)
 	* [Is it possible to introduce another feature](https://github.com/paladin-t/my_basic/wiki/Is-it-possible-to-introduce-another-feature)
+
+## CGI focused shell functions
+
+The standalone shell now includes CGI helper functions so BASIC scripts can run more safely in CGI environments:
+
+* `CGI_MODE()` returns `1` when running with CGI environment variables, otherwise `0`
+* `CGI_ENV(name$)` returns the value of an environment variable (for example `REQUEST_METHOD`)
+* `CGI_SET_CONTENT_TYPE(type$)` sets the HTTP `Content-Type` response header
+* `CGI_STATUS(code [, text$])` sets the HTTP status line
+* `CGI_QUERY(name$)` returns a URL-decoded value from POST body (`application/x-www-form-urlencoded`) first, then `QUERY_STRING` (GET fallback)
+* `CGI_PRINT(body$)` sends headers (once) and writes response content
+* `CGI_BODY()` returns the raw POST body text
+
+For PHP-like scripting style, the shell also preloads friendly aliases:
+
+* `GET(name$)`, `POST(name$)`, `PARAM(name$)`
+* `METHOD()`, `BODY()`
+* `ECHO(text$)`, `ECHOLN(text$)`
+* `CONTENT_TYPE(type$)`, `STATUS(code, text$)`
+* `HTML_PAGE(title$, body$)`
+* `JSON_OK(text$)`, `JSON_ERR(text$)`
+* `DB_OPEN(path$)`, `DB_CLOSE()`
+* `DB_EXEC(sql$)`, `DB_QUERY(sql$)`, `DB_ERROR()`
 
 ## Donate
 
